@@ -1,0 +1,338 @@
+    for (const b of INTERSECTIONS) {
+      if (a.id === b.id) continue;
+      const d = dist(a, b);
+      if (d < maxDist) {
+        const dir = segmentDirection(a, b);
+        const speedLimit = 11.1 + Math.random() * 5.6; // 40-60 km/h in m/s
+        const laneCount = d > 500 ? 2 : 1;
+        const seg: RoadSegment = {
+          id: `${a.id}�?{b.id}`,
+          fromIsec: a.id,
+          toIsec: b.id,
+          direction: dir,
+          length: d,
+          speedLimit,
+          laneCount,
+        };
+        ROAD_SEGMENTS.push(seg);
+        SEGMENT_MAP.set(seg.id, seg);
+        if (!SEGMENTS_BY_FROM.has(a.id)) SEGMENTS_BY_FROM.set(a.id, []);
+        SEGMENTS_BY_FROM.get(a.id)!.push(seg);
+        if (!SEGMENTS_BY_TO.has(b.id)) SEGMENTS_BY_TO.set(b.id, []);
+        SEGMENTS_BY_TO.get(b.id)!.push(seg);
+      }
+    }
+  }
+}
+
+buildNetwork();
+
+// 信号灯控制器 �?4相位（直�?左转），每个相位有绿黄全�?
+type SignalColor = 'green' | 'yellow' | 'red';
+
+interface PhaseConfig {
+  name: string;
+  greenDirections: Direction[];   // which approach directions get green this phase
+  greenTime: number;              // seconds of green
+  yellowTime: number;             // seconds of yellow
+  allRedTime: number;             // seconds of all-red after yellow
+}
+
+// 默认配时方案，所有路口先统一用同一套，后面MARL会覆�?function defaultPhases(isecId: string): PhaseConfig[] {
+  // Phase 1: N+S through + right-turn   (N→S, S→N through lanes, right turns on red allowed)
+  // Phase 2: N+S left-turn             (protected N→W, S→E)
+  // Phase 3: E+W through + right-turn
+  // Phase 4: E+W left-turn
+  // With yellow = 3s, all-red = 1.5s
+  return [
+    { name: 'NS-through', greenDirections: ['N', 'S'], greenTime: 35, yellowTime: 3, allRedTime: 1.5 },
+    { name: 'NS-left',    greenDirections: ['N', 'S'], greenTime: 18, yellowTime: 3, allRedTime: 1.5 },
+    { name: 'EW-through', greenDirections: ['E', 'W'], greenTime: 30, yellowTime: 3, allRedTime: 1.5 },
+    { name: 'EW-left',    greenDirections: ['E', 'W'], greenTime: 15, yellowTime: 3, allRedTime: 1.5 },
+  ];
+}
+
+class SignalController {
+  phases: PhaseConfig[];
+  currentPhaseIdx = 0;
+  timeInPhase = 0;         // seconds into current phase
+  subPhase: 'green' | 'yellow' | 'allred' = 'green';
+  subPhaseTime = 0;
+  totalCycleTime: number;
+
+  constructor(isecId: string) {
+    this.phases = defaultPhases(isecId);
+    this.totalCycleTime = this.phases.reduce((s, p) => s + p.greenTime + p.yellowTime + p.allRedTime, 0);
+    // Random initial phase offset so not all intersections sync
+    this.currentPhaseIdx = Math.floor(Math.random() * 4);
+    this.timeInPhase = Math.floor(Math.random() * this.phases[this.currentPhaseIdx].greenTime);
+  }
+
+  getColor(dir: Direction): SignalColor {
+    const phase = this.phases[this.currentPhaseIdx];
+    if (this.subPhase === 'allred') return 'red';
+    if (this.subPhase === 'yellow') {
+      return phase.greenDirections.includes(dir) ? 'yellow' : 'red';
+    }
+    return phase.greenDirections.includes(dir) ? 'green' : 'red';
+  }
+
+  /** Returns seconds remaining in current sub-phase */
+  getRemaining(dir: Direction): number {
+    const phase = this.phases[this.currentPhaseIdx];
+    const remaining = phase.greenTime + phase.yellowTime + phase.allRedTime - this.timeInPhase;
+    if (this.subPhase === 'green') {
+      if (phase.greenDirections.includes(dir)) {
+        return phase.greenTime - this.subPhaseTime;
+      }
+      // For red directions: time until their green starts
+      // Count through remaining phases to find when this direction gets green next
+      let accum = phase.greenTime - this.subPhaseTime + phase.yellowTime + phase.allRedTime;
+      for (let i = 1; i <= this.phases.length; i++) {
+        const next = this.phases[(this.currentPhaseIdx + i) % this.phases.length];
+        if (next.greenDirections.includes(dir)) return accum;
+        accum += next.greenTime + next.yellowTime + next.allRedTime;
+      }
+      return accum;
+    }
+    return Math.max(0, remaining);
+  }
+
+  // 推进dt�?  advance(dt: number) {
+    const phase = this.phases[this.currentPhaseIdx];
+    this.timeInPhase += dt;
+    this.subPhaseTime += dt;
+
+    if (this.subPhase === 'green' && this.subPhaseTime >= phase.greenTime) {
+      this.subPhase = 'yellow';
+      this.subPhaseTime = 0;
+    }
+    if (this.subPhase === 'yellow' && this.subPhaseTime >= phase.yellowTime) {
+      this.subPhase = 'allred';
+      this.subPhaseTime = 0;
+    }
+    if (this.subPhase === 'allred' && this.subPhaseTime >= phase.allRedTime) {
+      this.currentPhaseIdx = (this.currentPhaseIdx + 1) % this.phases.length;
+      this.timeInPhase = 0;
+      this.subPhase = 'green';
+      this.subPhaseTime = 0;
+    }
+  }
+
+  // 改绿灯时长（API 调用的）
+  setGreenDuration(dir: Direction, duration: number) {
+    // Find which phase covers this direction and adjust its green time
+    for (const phase of this.phases) {
+      if (phase.greenDirections.includes(dir)) {
+        phase.greenTime = Math.max(10, Math.min(90, duration));
+      }
+    }
+    this.totalCycleTime = this.phases.reduce((s, p) => s + p.greenTime + p.yellowTime + p.allRedTime, 0);
+  }
+}
+
+// vehicle agent �?每辆车一个对象，有点耗内存，但先这样
+
+interface Vehicle {
+  id: number;
+  type: string;           // 'car' | 'bus' | 'truck' | 'emergency'
+  speed: number;          // m/s
+  accel: number;          // m/s² (current acceleration)
+  position: number;       // meters from START of current segment (0 = just entered)
+  segmentId: string;      // which road segment it's on
+  routeRemaining: string[]; // remaining segments to traverse
+  turnIntent: 'left' | 'straight' | 'right';  // what it does at next intersection
+  waitTime: number;       // seconds spent at speed < 0.5 m/s
+  spawned: boolean;       // has entered the network yet
+}
+
+// IDM 加速度计算 �?Treiber et al. 2000, adapted for emergency scenarios
+
+function idmAccel(vehicle: Vehicle, leader: Vehicle | null, segment: RoadSegment): number {
+  const p = VEHICLE_TYPES[vehicle.type];
+  const v = Math.max(0, vehicle.speed);
+  const v0 = Math.min(p.maxSpeed, segment.speedLimit);
+
+  // Free-road acceleration (no leader)
+  const freeAccel = p.maxAccel * (1 - Math.pow(v / v0, 4));
+  if (!leader) return freeAccel;
+
+  // Gap to leader (MUST use leader's length, not follower's!)
+  const leaderLen = VEHICLE_TYPES[leader.type]?.length ?? 4.5;
+  const gap = leader.position - vehicle.position - leaderLen;
+
+  // Collision imminent �?use emergency deceleration
+  if (gap <= 0) return -p.emergDecel;
+
+  // Standard IDM: Δv = v - v_leader
+  const dv = v - leader.speed;
+  const sStar = Math.max(0,
+    p.minGap + v * p.desiredTimeHeadway + (v * dv) / (2 * Math.sqrt(p.maxAccel * p.comfDecel))
+  );
+
+  const s = Math.max(0.1, gap);
+
+  // When gap is critically small relative to desired gap, blend in emergency decel
+  const criticalRatio = sStar / s;
+  if (criticalRatio > 4) {
+    // Emergency: gap is less than 25% of desired �?use emergency decel
+    const a = p.maxAccel * (1 - Math.pow(v / v0, 4) - criticalRatio * criticalRatio);
+    return Math.max(-p.emergDecel, a);
+  }
+
+  // Normal IDM �?cap at comfortable deceleration
+  const a = p.maxAccel * (1 - Math.pow(v / v0, 4) - criticalRatio * criticalRatio);
+  return Math.max(-p.comfDecel, Math.min(p.maxAccel, a));
+}
+
+// 车辆生成�?�?按泊松过�?spawn，但实际用了简化版
+
+interface ZoneDemand {
+  zoneType: SimZoneType;
+  /** vehicles per hour per entry lane during peak hour (0-10 scale �?actual vph) */
+  peakFlowRate: number;
+  /** 24-hour pattern (0-10 scale) */
+  hourlyPattern: number[];
+}
+
+const ZONE_DEMAND: Record<SimZoneType, ZoneDemand> = {
+  industrial: {
+    zoneType: 'industrial',
+    peakFlowRate: 800,
+    hourlyPattern: [2,1,1,1,2,5,12,28,32,25,20,16,14,14,16,18,24,28,30,22,14,8,5,3],
+  },
+  tech_park: {
+    zoneType: 'tech_park',
+    peakFlowRate: 650,
+    hourlyPattern: [1,1,1,1,1,2,8,24,34,30,22,16,14,14,16,20,26,32,32,20,10,5,2,1],
+  },
+  school: {
+    zoneType: 'school',
+    peakFlowRate: 400,
+    hourlyPattern: [1,1,1,1,1,2,10,32,28,10,7,8,10,8,8,12,28,22,10,5,3,2,1,1],
+  },
+  commercial: {
+    zoneType: 'commercial',
+    peakFlowRate: 900,
+    hourlyPattern: [3,2,2,2,2,4,10,18,28,36,40,42,40,36,36,38,42,44,40,30,22,14,8,5],
+  },
+  residential: {
+    zoneType: 'residential',
+    peakFlowRate: 500,
+    hourlyPattern: [6,4,3,3,3,6,20,30,22,14,12,10,10,10,12,16,22,28,32,28,18,12,8,6],
+  },
+};
+
+// Arrival rate in vehicles per second for a given lane at a given hour
+function arrivalRate(zoneType: SimZoneType, hour: number, minute: number): number {
+  const demand = ZONE_DEMAND[zoneType];
+  const nowPattern = demand.hourlyPattern[hour] / 10; // 0-1
+  const nextPattern = demand.hourlyPattern[(hour + 1) % 24] / 10;
+  const smooth = nowPattern + (nextPattern - nowPattern) * (minute / 60);
+  // Convert peak flow rate to vehicles/sec: peakFlowRate * pattern / 3600
+  return demand.peakFlowRate * smooth / 3600;
+}
+
+// ─── Vehicle ID counter (instance-level, not module global) ─
+
+// zone 定义
+
+interface ZoneDef {
+  type: SimZoneType;
+  intersections: { id: string; name: string; nameZh: string }[];
+}
+
+const ZONE_DEFS: ZoneDef[] = [
+  {
+    type: 'industrial',
+    intersections: [
+      { id: 'ind-1', name: 'Industry Rd & Truck Way', nameZh: '工业大道与卡车路' },
+      { id: 'ind-2', name: 'Factory Blvd & Warehouse Ave', nameZh: '工厂路与仓储�? },
+    ],
+  },
+  {
+    type: 'tech_park',
+    intersections: [
+      { id: 'tech-1', name: 'Innovation Ave & Code St', nameZh: '创新大道与代码路' },
+      { id: 'tech-2', name: 'AI Blvd & Data Dr', nameZh: 'AI大道与数据路' },
+    ],
+  },
+  {
+    type: 'school',
+    intersections: [
+      { id: 'sch-1', name: 'School Rd & Campus Way', nameZh: '学校路与校园�? },
+      { id: 'sch-2', name: 'Library Ave & Sports Blvd', nameZh: '图书馆路与运动大�? },
+    ],
+  },
+  {
+    type: 'commercial',
+    intersections: [
+      { id: 'com-1', name: 'Main St & Market Sq', nameZh: '主街与市场广�? },
+      { id: 'com-2', name: 'Shopping Blvd & Mall Dr', nameZh: '购物大道与商场路' },
+    ],
+  },
+  {
+    type: 'residential',
+    intersections: [
+      { id: 'res-1', name: 'Garden Rd & Park Ln', nameZh: '花园路与公园�? },
+      { id: 'res-2', name: 'Lake Ave & Tree St', nameZh: '湖滨大道与树林路' },
+      { id: 'res-3', name: 'Sunrise Blvd & Moon Dr', nameZh: '日出大道与月亮路' },
+    ],
+  },
+];
+
+// time helpers
+
+function pad(n: number): string { return n.toString().padStart(2, '0'); }
+
+function getTimeOfDay(hour: number): 'dawn' | 'morning' | 'noon' | 'afternoon' | 'evening' | 'night' {
+  if (hour < 6) return 'night';
+  if (hour < 8) return 'dawn';
+  if (hour < 12) return 'morning';
+  if (hour < 14) return 'noon';
+  if (hour < 18) return 'afternoon';
+  if (hour < 21) return 'evening';
+  return 'night';
+}
+
+function isRushHour(hour: number): boolean {
+  return (hour >= 7 && hour <= 9) || (hour >= 17 && hour <= 19);
+}
+
+// pedestrian �?目前只是占位，没做真实的人行仿真
+
+const PEDESTRIAN_BASE: Record<SimZoneType, number> = {
+  industrial: 1, tech_park: 2, school: 6, commercial: 5, residential: 3,
+};
+
+function formatSimTime(hour: number, minute: number): string {
+  const h = Math.floor(hour);
+  const m = Math.floor(minute);
+  const s = Math.round((minute - m) * 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+// 仿真引擎主类 �?单例 trafficSim
+
+// PHYSICS_DT: simulation sub-step in seconds.
+// Was 1.0 �?too coarse: at 50 km/h (13.9 m/s) a vehicle moves 14 m/step,
+// making IDM collision avoidance ineffective. Set to 0.25 s (�?.5 m/step).
+const PHYSICS_DT = 0.25; // sim-seconds per internal step
+
+// MARL 训练用的指标
+
+export interface TrafficMetrics {
+  avgSpeed: number;           // km/h, global average
+  totalQueue: number;         // total vehicles queued (speed < 5 km/h)
+  totalVehicles: number;      // total active vehicles
+  avgWaitTime: number;        // seconds, average wait time
+  carbonEstimate: number;     // kg CO2 emitted in this interval
+}
+
+// 排放系数，单�?kg CO2/h，参考速度下的值，数据来源不太靠谱，后续要校准
+const EMISSION_FACTORS: Record<string, number> = {
+  car: 2.3, bus: 8.0, truck: 10.0, emergency: 3.0,
+};
+
+class TrafficSimulationEngine {
+

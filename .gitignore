@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+.vscode/
+# Large training data & models (>10MB)
+backend/data/
+backend/models/*.onnx
+# Keep directory structure
+!backend/data/.gitkeep
+!backend/models/.gitkeep
